@@ -381,6 +381,10 @@
     z-index: 5;
   }
 </style>
+<!-- Firebase (compat) for multiplayer room signaling -->
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
 </head>
 <body>
 
@@ -547,8 +551,31 @@ function loadCampaign(idx) {
   // Preserve multiplayer room code if present in URL
   const urlParams = new URLSearchParams(window.location.search || '');
   const room = urlParams.get('room');
+  
+  // If host is starting a multiplayer session, signal that level is loaded
   if (room) {
-    window.location.href = 'game.html?room=' + encodeURIComponent(room);
+    try {
+      const firebaseConfig = {
+        apiKey: "AIzaSyBu4N1LXy3dgnHS6yZKOdGzY4baby8fqvQ",
+        authDomain: "riel-runner.firebaseapp.com",
+        projectId: "riel-runner",
+        storageBucket: "riel-runner.firebasestorage.app",
+        messagingSenderId: "73958110392",
+        appId: "1:73958110392:web:a8a8751968ff54b9d1f04d",
+        measurementId: "G-EX5FSVV7DC"
+      };
+      if (!firebase.apps || !firebase.apps.length) firebase.initializeApp(firebaseConfig);
+      const db = firebase.database();
+      // Set levelLoaded flag so waiting clients can join
+      db.ref('rooms/' + room + '/levelLoaded').set(true).then(() => {
+        window.location.href = 'game.html?room=' + encodeURIComponent(room);
+      }).catch(() => {
+        window.location.href = 'game.html?room=' + encodeURIComponent(room);
+      });
+    } catch(e) {
+      console.warn('levelLoaded signal failed', e);
+      window.location.href = 'game.html?room=' + encodeURIComponent(room);
+    }
   } else {
     window.location.href = 'game.html';
   }
