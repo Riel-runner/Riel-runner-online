@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Riel Runner — Multiplayer Lobby</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  body{font-family:'Press Start 2P',monospace;background:#0a0e1a;color:#e8e8d0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+  .card{width:100%;max-width:720px;padding:18px;border:4px solid #444;box-shadow:0 8px #000;background:rgba(10,14,26,0.92)}
+  h1{color:#f5c400;margin-bottom:8px}
+  .row{display:flex;gap:8px;align-items:center;margin:8px 0}
+  input[type=text]{flex:1;padding:10px;background:#071028;border:3px solid #333;color:#e8e8d0}
+  .btn{padding:10px 14px;background:#f5c400;color:#071028;border:none;cursor:pointer}
+  .btn.secondary{background:transparent;border:3px solid #444;color:#e8e8d0}
+  .info{font-size:12px;color:#9aa}
+  .players{margin-top:10px}
+  .player{padding:6px 8px;background:#071a2a;margin:4px 0}
+  .code{font-size:20px;letter-spacing:6px;color:#fff}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>MULTIPLAYER LOBBY</h1>
+    <div class="info">Create a room to host or join with a 4-character code. No usernames or chat required.</div>
+
+    <div class="row" style="margin-top:12px">
+      <button id="createBtn" class="btn">Create Room</button>
+      <button id="joinBtn" class="btn secondary">Join Room</button>
+      <input id="joinCode" type="text" maxlength="6" placeholder="Enter code" />
+    </div>
+
+    <div id="roomArea" style="display:none;margin-top:14px">
+      <div>Room code: <span id="roomCode" class="code">----</span></div>
+      <div class="info">Players in room: <span id="playerCount">0</span></div>
+      <div class="players" id="playersList"></div>
+      <div style="margin-top:10px">
+        <button id="startBtn" class="btn">Start Session (Host)</button>
+        <button id="leaveBtn" class="btn secondary">Leave</button>
+      </div>
+    </div>
+
+    <div id="status" style="margin-top:10px" class="info"></div>
+    <div style="margin-top:12px"><a href="index.html" class="btn secondary">Back</a></div>
+  </div>
+
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+<script>
+// Firebase config (copied from Firebase info.txt)
+const firebaseConfig = {
+  apiKey: "AIzaSyBu4N1LXy3dgnHS6yZKOdGzY4baby8fqvQ",
+  authDomain: "riel-runner.firebaseapp.com",
+  projectId: "riel-runner",
+  storageBucket: "riel-runner.firebasestorage.app",
+  messagingSenderId: "73958110392",
+  appId: "1:73958110392:web:a8a8751968ff54b9d1f04d",
+  measurementId: "G-EX5FSVV7DC"
+};
+
+firebase.initializeApp(firebaseConfig);
+
+let authUid = null;
+let db = firebase.database();
+let currentRoom = null;
+let isHost = false;
+
+const status = document.getElementById('status');
+const createBtn = document.getElementById('createBtn');
+const joinBtn = document.getElementById('joinBtn');
+const joinCodeInput = document.getElementById('joinCode');
+const roomArea = document.getElementById('roomArea');
+const roomCodeEl = document.getElementById('roomCode');
+const playerCountEl = document.getElementById('playerCount');
+const playersList = document.getElementById('playersList');
+const startBtn = document.getElementById('startBtn');
+const leaveBtn = document.getElementById('leaveBtn');
+
+function setStatus(s){ status.textContent = s; }
+
+// Anonymous sign-in
+setStatus('Signing in anonymously...');
+firebase.auth().signInAnonymously()
+  .then(() => {
+    authUid = firebase.auth().currentUser.uid;
+    setStatus('Signed in. Ready.');
+  }).catch(err => {
+    console.error(err); setStatus('Auth error: ' + err.message);
+  });
+
+function genCode(len = 4){
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let c = '';
+  for(let i=0;i<len;i++) c += chars.charAt(Math.floor(Math.random()*chars.length));
+  return c;
+}
+
+function showRoom(code){
+  roomArea.style.display = 'block';
+  roomCodeEl.textContent = code;
+}
+
+function updatePlayersList(playersObj){
+  playersList.innerHTML = '';
+  let count = 0;
+  for(const uid in playersObj){
+    count++;
+    const div = document.createElement('div');
+    div.className = 'player';
+    div.textContent = uid === authUid ? uid + ' (you)' : uid;
+    playersList.appendChild(div);
+  }
+  playerCountEl.textContent = count;
+}
+
+function attachRoomListeners(code){
+  const roomRef = db.ref('rooms/' + code);
+  // players
+  roomRef.child('players').on('value', snap => {
+    const val = snap.val() || {};
+    updatePlayersList(val);
+  });
+  // started flag
+  roomRef.child('started').on('value', snap => {
+    const v = snap.val();
+    if(v === true){
+      setStatus('Session started — redirecting to level select...');
+      // Add room code to query string so game can pick it up later
+      window.location.href = 'level-select.html?room=' + encodeURIComponent(code);
+    }
+  });
+}
+
+createBtn.addEventListener('click', () => {
+  if(!authUid){ setStatus('Not signed in yet'); return; }
+  const code = genCode(4);
+  const roomRef = db.ref('rooms/' + code);
+  roomRef.get().then(snap => {
+    if(snap.exists()){
+      setStatus('Collision, trying again...');
+      createBtn.click();
+      return;
+    }
+    // create room
+    roomRef.set({ host: authUid, started: false, createdAt: Date.now() }).then(()=>{
+      isHost = true; currentRoom = code;
+      showRoom(code);
+      setStatus('Room created. Waiting for players.');
+      // presence: players/{uid} with onDisconnect cleanup
+      const playersRef = roomRef.child('players').child(authUid);
+      playersRef.set({ joinedAt: Date.now(), host: true });
+      playersRef.onDisconnect().remove();
+      attachRoomListeners(code);
+    }).catch(err => setStatus('Create error: ' + err.message));
+  });
+});
+
+joinBtn.addEventListener('click', () => {
+  const raw = (joinCodeInput.value || '').trim().toUpperCase();
+  if(!raw){ setStatus('Enter a room code'); return; }
+  const code = raw;
+  const roomRef = db.ref('rooms/' + code);
+  roomRef.get().then(snap => {
+    if(!snap.exists()){ setStatus('Room not found'); return; }
+    // join
+    currentRoom = code; isHost = false;
+    showRoom(code);
+    setStatus('Joined room — waiting for host to start.');
+    const playersRef = roomRef.child('players').child(authUid);
+    playersRef.set({ joinedAt: Date.now() });
+    playersRef.onDisconnect().remove();
+    attachRoomListeners(code);
+  }).catch(err => setStatus('Join error: ' + err.message));
+});
+
+startBtn.addEventListener('click', () => {
+  if(!currentRoom) return setStatus('Not in a room');
+  if(!isHost) return setStatus('Only host can start');
+  const roomRef = db.ref('rooms/' + currentRoom);
+  roomRef.update({ started: true }).then(()=>{
+    setStatus('Session started');
+    // host will also redirect via listener
+  }).catch(err => setStatus('Start error: ' + err.message));
+});
+
+leaveBtn.addEventListener('click', () => {
+  if(!currentRoom) return window.location.href='index.html';
+  const roomRef = db.ref('rooms/' + currentRoom);
+  roomRef.child('players').child(authUid).remove().then(()=>{
+    if(isHost){
+      // if host leaves, delete room entirely
+      roomRef.remove();
+    }
+    currentRoom = null; isHost = false; roomArea.style.display='none'; setStatus('Left room');
+  });
+});
+
+</script>
+</body>
+</html>
