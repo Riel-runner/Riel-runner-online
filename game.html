@@ -311,8 +311,11 @@ function applySnapshot(snap){
   try {
     // basic campaign sync
     if (typeof snap.campaignLevel !== 'undefined') campaign.level = snap.campaignLevel;
-    // Player authoritative values
-    if (snap.player) {
+    
+    // Player authoritative values — only update if THIS client is not the one sending inputs
+    // (i.e., only apply if we are the host receiving our own snapshot, or if this is truly another player)
+    if (snap.player && mpIsHost) {
+      // Host uses its own player state from the snapshot
       player.x = snap.player.x || player.x;
       player.y = snap.player.y || player.y;
       player.hp = typeof snap.player.hp === 'number' ? snap.player.hp : player.hp;
@@ -321,6 +324,7 @@ function applySnapshot(snap){
       player.lives = typeof snap.player.lives === 'number' ? snap.player.lives : player.lives;
       player.facingRight = !!snap.player.facingRight;
     }
+    // Non-host clients DON'T apply snap.player — they maintain their own local player for camera
 
     // Replace NPCs with snapshot (lightweight)
     if (Array.isArray(snap.npcs)){
@@ -370,6 +374,12 @@ function applySnapshot(snap){
       for (const l of snap.lasers) lasers.push({ x:l.x, y:l.y, w:l.w, h:l.h||6, lastDamageFrame: frameCount - 999 });
     }
 
+    // Bullets — clients need to see host-spawned bullets
+    if (Array.isArray(snap.bullets)){
+      bullets.length = 0;
+      for (const b of snap.bullets) bullets.push({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive });
+    }
+
     // Other players (clients) — simple representation
     if (Array.isArray(snap.otherPlayers)){
       // Replace local otherPlayers only on client side
@@ -378,7 +388,7 @@ function applySnapshot(snap){
         // Note: local clients won't simulate other players' physics; they rely on snapshot positions
         const tmp = {};
         for (const op of snap.otherPlayers) {
-          tmp[op.uid] = { x: op.x, y: op.y, hp: op.hp, bullets: op.bullets, lives: op.lives, facingRight: op.facingRight };
+          tmp[op.uid] = { x: op.x, y: op.y, hp: op.hp, bullets: op.bullets, lives: op.lives, facingRight: op.facingRight, animFrame: op.animFrame, gunFlash: op.gunFlash };
         }
         // assign into otherPlayers for rendering
         for (const k in otherPlayers) if (!tmp[k]) delete otherPlayers[k];
@@ -456,13 +466,27 @@ function simulateOtherPlayers(){
       const crossTop = prevBottom <= p.y && curBottom >= p.y;
       if (inX && crossTop && op.vy >= 0){ op.y = p.y - PLAYER_H; op.vy = 0; op.onGround = true; }
     }
-    // shooting (simple, no auto-aim): Space fires forward
+    // shooting with auto-aim (same as player)
     if (!op.shootTimer) op.shootTimer = 0;
     if (keysLocal['Space'] && op.shootTimer <= 0 && (op.bullets||0) > 0){
       const sx = op.facingRight ? op.x + PLAYER_W + 2 : op.x - 6;
       const sy = op.y + 10;
-      const dx = op.facingRight ? 1 : -1;
-      const dy = 0;
+      
+      // Auto-aim: find closest NPC
+      let dx = op.facingRight ? 1 : -1, dy = 0;
+      let closest = null, bestDist = Infinity;
+      for (const n of npcs) {
+        if (n.dead) continue;
+        const d = Math.hypot(n.x - op.x, n.y - op.y);
+        if (d < bestDist) { bestDist = d; closest = n; }
+      }
+      if (closest) {
+        const tx = closest.x + 10 - sx;
+        const ty = closest.y + 12 - sy;
+        const len = Math.hypot(tx, ty) || 1;
+        dx = tx / len; dy = ty / len;
+      }
+      
       bullets.push({ x: sx, y: sy, dx, dy, alive:true });
       op.gunFlash = 5;
       op.bullets = Math.max(0, (op.bullets||0) - 1);
@@ -595,7 +619,7 @@ const DASH_DISTANCE  = 400;          // px — half screen dash
 const DASH_COOLDOWN  = 600;          // frames — 10 seconds at 60fps
 const DASH_DURATION  = 10;           // frames the dash lasts
 const GAME_VERSION   = 'V5';
-const SNAPSHOT_FRAMES = 6; // host snapshot interval (frames) ~10Hz
+const SNAPSHOT_FRAMES = 3; // host snapshot interval (frames) ~20Hz (doubled from 6)
 
 // ═══════════════════════════════════════════════════════════════
 //  WORLD / CAMERA
@@ -2389,7 +2413,8 @@ function loop() {
           magazines: magazines.map(m => ({ x: m.x, y: m.y, w: m.w, h: m.h, collected: !!m.collected })),
           powerups: powerups.map(p => ({ x: p.x, y: p.y, w: p.w, h: p.h, type: p.type, collected: !!p.collected })),
           lasers: lasers.map(l => ({ x: l.x, y: l.y, w: l.w, h: l.h })),
-          otherPlayers: Object.values(otherPlayers).map(op => ({ uid: op.uid, x: op.x, y: op.y, hp: op.hp, bullets: op.bullets, lives: op.lives, facingRight: op.facingRight }))
+          bullets: bullets.map(b => ({ x: b.x, y: b.y, dx: b.dx, dy: b.dy, alive: !!b.alive })),
+          otherPlayers: Object.values(otherPlayers).map(op => ({ uid: op.uid, x: op.x, y: op.y, hp: op.hp, bullets: op.bullets, lives: op.lives, facingRight: op.facingRight, animFrame: op.animFrame, gunFlash: op.gunFlash }))
         };
         mpDb.ref('rooms/' + MULTI_ROOM + '/snapshot').set(snap);
       } catch (e) { console.warn('snapshot write err', e); }
