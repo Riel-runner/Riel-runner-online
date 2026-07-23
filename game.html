@@ -270,13 +270,13 @@ function joinRoomPresence(code) {
   mpDb.ref('rooms/' + code + '/snapshot').on('value', snap => {
     const val = snap.val();
     if (!val) return;
-    if (!mpIsHost) applySnapshot(val);
+    applySnapshot(val);
   });
 
-  // Listen for inputs (host will process inputs into simulated other players)
+  // Listen for inputs (everyone processes inputs into simulated other players)
   mpDb.ref('rooms/' + code + '/inputs').on('value', snap => {
     const val = snap.val() || {};
-    if (mpIsHost) processInputsForHost(val);
+    processInputsForHost(val);
   });
 
   // Listen for shop state — when host enters shop, everyone should go to shop.html?room=CODE
@@ -304,7 +304,7 @@ function sendInputState(){
     const short = {};
     // capture only relevant keys
     ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].forEach(k => { short[k]=!!keys[k]; });
-    const p = { keys: short, ts: Date.now(), lastShot: pendingShotTs || 0 };
+    const p = { keys: short, ts: Date.now(), lastShot: pendingShotTs || 0, pos: { x: player.x, y: player.y } };
     mpDb.ref('rooms/' + MULTI_ROOM + '/inputs/' + mpUid).set(p);
     // Clear the pendingShotTs after sending once (host will process it)
     pendingShotTs = 0;
@@ -441,11 +441,13 @@ function processInputsForHost(snapshotVal){
     if (uid === mpUid) continue;
     const dat = inputsMap[uid] || {};
     if (!otherPlayers[uid]){
-      // spawn near host player
+      // spawn near reported position or near local player
+      const sx = (dat.pos && typeof dat.pos.x === 'number') ? dat.pos.x : Math.max(0, player.x - 120 + Math.random()*240);
+      const sy = (dat.pos && typeof dat.pos.y === 'number') ? dat.pos.y : GROUND_Y - PLAYER_H;
       otherPlayers[uid] = {
         uid: uid,
-        x: Math.max(0, player.x - 120 + Math.random()*240),
-        y: GROUND_Y - PLAYER_H,
+        x: sx,
+        y: sy,
         vx: 0, vy: 0, onGround: true,
         hp: player.maxHp, maxHp: player.maxHp, bullets: 20, lives:3,
         shootTimer: 0, facingRight: true,
@@ -453,9 +455,13 @@ function processInputsForHost(snapshotVal){
         pendingShotTs: dat.lastShot || 0
       };
     } else {
+      // update input and last seen
       otherPlayers[uid].input = dat.keys || {};
       otherPlayers[uid].lastSeen = dat.ts || now;
       if (dat.lastShot) otherPlayers[uid].pendingShotTs = dat.lastShot;
+      // update reported position so rendering/simulation can use it
+      if (dat.pos && typeof dat.pos.x === 'number') otherPlayers[uid].x = dat.pos.x;
+      if (dat.pos && typeof dat.pos.y === 'number') otherPlayers[uid].y = dat.pos.y;
     }
   }
 }
@@ -847,14 +853,6 @@ function updatePlayer() {
 
   // If connected to a multiplayer room and NOT the host, do not locally simulate inputs.
   // The client relies on host snapshots to update authoritative state.
-  if (typeof MULTI_ROOM !== 'undefined' && MULTI_ROOM && typeof mpDb !== 'undefined' && mpDb && !mpIsHost) {
-    // Keep camera centered on the (authoritative) player position and tick power timers so UI remains smooth.
-    camX = player.x - BASE_W * 0.35;
-    camX = Math.max(0, Math.min(LEVEL_WIDTH - BASE_W, camX));
-    if (player.jumpPowerTimer > 0) { player.jumpPowerTimer--; if (player.jumpPowerTimer <= 0) player.jumpMult = 1; }
-    if (player.speedPowerTimer > 0) { player.speedPowerTimer--; if (player.speedPowerTimer <= 0) player.speedMult = 1; }
-    return;
-  }
 
   // Horizontal
   let moving = false;
@@ -2458,7 +2456,8 @@ function loop() {
 
   if (gameState === 'playing') {
     // Host simulates other players based on inputs
-    if (typeof MULTI_ROOM !== 'undefined' && MULTI_ROOM && mpDb && mpIsHost) {
+    if (typeof MULTI_ROOM !== 'undefined' && MULTI_ROOM && mpDb) {
+      // Everyone simulates other players locally (based on inputsMap)
       simulateOtherPlayers();
     }
 
