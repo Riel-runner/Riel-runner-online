@@ -198,6 +198,11 @@ let mpDb = null, mpUid = null, mpIsHost = false;
 // multiplayer helpers
 const otherPlayers = {}; // populated on host simulation and client snapshots
 let inputsMap = {};
+// client-side prediction helpers
+let pendingShotTs = 0;                 // timestamp of a locally-fired bullet awaiting server ack
+const predictedBullets = [];          // local predicted bullets not yet acknowledged
+const processedShotTimestamps = {};   // host-side: tracks which client shot timestamps were processed
+
 
 if (MULTI_ROOM) {
   try {
@@ -299,8 +304,10 @@ function sendInputState(){
     const short = {};
     // capture only relevant keys
     ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].forEach(k => { short[k]=!!keys[k]; });
-    const p = { keys: short, ts: Date.now() };
+    const p = { keys: short, ts: Date.now(), lastShot: pendingShotTs || 0 };
     mpDb.ref('rooms/' + MULTI_ROOM + '/inputs/' + mpUid).set(p);
+    // Clear the pendingShotTs after sending once (host will process it)
+    pendingShotTs = 0;
   } catch(e){ console.warn('sendInputState err', e); }
 }
 
@@ -311,10 +318,9 @@ function applySnapshot(snap){
     // basic campaign sync
     if (typeof snap.campaignLevel !== 'undefined') campaign.level = snap.campaignLevel;
     
-    // Player authoritative values — always apply host snapshot so clients mirror host screen
+    // Player authoritative values
     if (snap.player) {
-      player.x = (typeof snap.player.x === 'number') ? snap.player.x : player.x;
-      player.y = (typeof snap.player.y === 'number') ? snap.player.y : player.y;
+      // Apply immediate HP/bullets/lives so UI stays consistent
       player.hp = typeof snap.player.hp === 'number' ? snap.player.hp : player.hp;
       player.maxHp = typeof snap.player.maxHp === 'number' ? snap.player.maxHp : player.maxHp;
       player.bullets = typeof snap.player.bullets === 'number' ? snap.player.bullets : player.bullets;
@@ -322,6 +328,16 @@ function applySnapshot(snap){
       player.facingRight = !!snap.player.facingRight;
       player.animFrame = typeof snap.player.animFrame !== 'undefined' ? snap.player.animFrame : player.animFrame;
       player.gunFlash = typeof snap.player.gunFlash !== 'undefined' ? snap.player.gunFlash : player.gunFlash;
+
+      if (mpIsHost) {
+        // Host applies authoritative position directly
+        player.x = (typeof snap.player.x === 'number') ? snap.player.x : player.x;
+        player.y = (typeof snap.player.y === 'number') ? snap.player.y : player.y;
+      } else {
+        // Non-host: keep local predicted position, but store server position for reconciliation
+        player.serverX = (typeof snap.player.x === 'number') ? snap.player.x : (player.serverX || player.x);
+        player.serverY = (typeof snap.player.y === 'number') ? snap.player.y : (player.serverY || player.y);
+      }
     }
 
     // Replace NPCs with snapshot (lightweight)
@@ -372,10 +388,28 @@ function applySnapshot(snap){
       for (const l of snap.lasers) lasers.push({ x:l.x, y:l.y, w:l.w, h:l.h||6, lastDamageFrame: frameCount - 999 });
     }
 
-    // Bullets — clients need to see host-spawned bullets
+    // Bullets — merge host-authoritative bullets with local predicted bullets (clients only)
     if (Array.isArray(snap.bullets)){
-      bullets.length = 0;
-      for (const b of snap.bullets) bullets.push({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive });
+      if (!mpIsHost) {
+        const auth = snap.bullets.map(b => ({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive, owner: b.owner || null, createdFromInputTs: b.createdFromInputTs || null }));
+        // Remove predicted bullets that are acknowledged by the server
+        const remainingPred = [];
+        for (const p of predictedBullets) {
+          const matched = auth.some(a => a.owner && p.owner && a.owner === p.owner && a.createdFromInputTs === p.createdFromInputTs);
+          if (!matched) remainingPred.push(p);
+        }
+        // Compose final bullets array: authoritative + remaining predicted
+        bullets.length = 0;
+        for (const a of auth) bullets.push(a);
+        for (const p of remainingPred) bullets.push(p);
+        // Keep predictedBullets list updated
+        predictedBullets.length = 0;
+        for (const p of remainingPred) predictedBullets.push(p);
+      } else {
+        // Host just takes authoritative bullets
+        bullets.length = 0;
+        for (const b of snap.bullets) bullets.push({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive, owner: b.owner || null, createdFromInputTs: b.createdFromInputTs || null });
+      }
     }
 
     // Other players (clients) — simple representation
@@ -415,11 +449,13 @@ function processInputsForHost(snapshotVal){
         vx: 0, vy: 0, onGround: true,
         hp: player.maxHp, maxHp: player.maxHp, bullets: 20, lives:3,
         shootTimer: 0, facingRight: true,
-        input: dat.keys || {}, lastSeen: dat.ts || now
+        input: dat.keys || {}, lastSeen: dat.ts || now,
+        pendingShotTs: dat.lastShot || 0
       };
     } else {
       otherPlayers[uid].input = dat.keys || {};
       otherPlayers[uid].lastSeen = dat.ts || now;
+      if (dat.lastShot) otherPlayers[uid].pendingShotTs = dat.lastShot;
     }
   }
 }
@@ -466,7 +502,9 @@ function simulateOtherPlayers(){
     }
     // shooting with auto-aim (same as player)
     if (!op.shootTimer) op.shootTimer = 0;
-    if (keysLocal['Space'] && op.shootTimer <= 0 && (op.bullets||0) > 0){
+    // If server indicated a pendingShotTs (from client's input), prefer that for authoritative spawn
+    const shotTsToUse = op.pendingShotTs || (keysLocal['Space'] ? Date.now() : 0);
+    if (shotTsToUse && op.shootTimer <= 0 && (op.bullets||0) > 0){
       const sx = op.facingRight ? op.x + PLAYER_W + 2 : op.x - 6;
       const sy = op.y + 10;
       
@@ -484,11 +522,18 @@ function simulateOtherPlayers(){
         const len = Math.hypot(tx, ty) || 1;
         dx = tx / len; dy = ty / len;
       }
-      
-      bullets.push({ x: sx, y: sy, dx, dy, alive:true });
-      op.gunFlash = 5;
-      op.bullets = Math.max(0, (op.bullets||0) - 1);
-      op.shootTimer = SHOOT_COOLDOWN;
+
+      // Avoid double-processing the same shot timestamp
+      if (!processedShotTimestamps[op.uid]) processedShotTimestamps[op.uid] = {};
+      const usedTs = op.pendingShotTs || 0;
+      if (!usedTs || !processedShotTimestamps[op.uid][usedTs]) {
+        bullets.push({ x: sx, y: sy, dx, dy, alive:true, owner: op.uid, createdFromInputTs: usedTs || null });
+        if (usedTs) processedShotTimestamps[op.uid][usedTs] = true;
+        op.gunFlash = 5;
+        op.bullets = Math.max(0, (op.bullets||0) - 1);
+        op.shootTimer = SHOOT_COOLDOWN;
+      }
+      op.pendingShotTs = 0; // clear after processing
     }
     if (op.shootTimer > 0) op.shootTimer--;
 
@@ -907,6 +952,21 @@ function updatePlayer() {
     player.shootTimer = SHOOT_COOLDOWN;
   }
 
+  // Reconciliation: nudge local predicted position toward server authoritative position when not host
+  if (!mpIsHost && typeof player.serverX === 'number') {
+    const sx = player.serverX; const sy = player.serverY || player.y;
+    const dx = sx - player.x; const dy = sy - player.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 120) {
+      // huge discrepancy: snap to server position
+      player.x = sx; player.y = sy;
+    } else if (dist > 0.5) {
+      // smooth correction
+      player.x += dx * 0.15;
+      player.y += dy * 0.15;
+    }
+  }
+
   // Camera: keep player centred-ish
   camX = player.x - BASE_W * 0.35;
   camX = Math.max(0, Math.min(LEVEL_WIDTH - BASE_W, camX));
@@ -990,7 +1050,18 @@ function firePlayerBullet() {
     dx = tx / len; dy = ty / len;
   }
 
-  bullets.push({ x: startX, y: startY, dx, dy, alive: true });
+  const shotTs = Date.now();
+  if (MULTI_ROOM && !mpIsHost && mpUid) {
+    // Spawn a predicted bullet immediately for responsive feedback
+    const pb = { x: startX, y: startY, dx, dy, alive: true, owner: mpUid, createdFromInputTs: shotTs, predicted: true };
+    bullets.push(pb);
+    predictedBullets.push(pb);
+    pendingShotTs = shotTs;
+  } else {
+    // Host or single-player: authoritative spawn
+    bullets.push({ x: startX, y: startY, dx, dy, alive: true, owner: mpUid || null, createdFromInputTs: null });
+  }
+
   player.gunFlash = 5;
 
   // Gunshot sound
@@ -2411,7 +2482,7 @@ function loop() {
           magazines: magazines.map(m => ({ x: m.x, y: m.y, w: m.w, h: m.h, collected: !!m.collected })),
           powerups: powerups.map(p => ({ x: p.x, y: p.y, w: p.w, h: p.h, type: p.type, collected: !!p.collected })),
           lasers: lasers.map(l => ({ x: l.x, y: l.y, w: l.w, h: l.h })),
-          bullets: bullets.map(b => ({ x: b.x, y: b.y, dx: b.dx, dy: b.dy, alive: !!b.alive })),
+          bullets: bullets.map(b => ({ x: b.x, y: b.y, dx: b.dx, dy: b.dy, alive: !!b.alive, owner: b.owner || null, createdFromInputTs: b.createdFromInputTs || null })),
           otherPlayers: Object.values(otherPlayers).map(op => ({ uid: op.uid, x: op.x, y: op.y, hp: op.hp, bullets: op.bullets, lives: op.lives, facingRight: op.facingRight, animFrame: op.animFrame, gunFlash: op.gunFlash }))
         };
         mpDb.ref('rooms/' + MULTI_ROOM + '/snapshot').set(snap);
