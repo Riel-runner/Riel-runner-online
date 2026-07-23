@@ -203,6 +203,9 @@ let pendingShotTs = 0;                 // timestamp of a locally-fired bullet aw
 const predictedBullets = [];          // local predicted bullets not yet acknowledged
 const processedShotTimestamps = {};   // host-side: tracks which client shot timestamps were processed
 
+// Feature flags
+const USE_SNAPSHOT_RECONCILE = false; // peer-sim mode: disable authoritative position snapping
+
 
 if (MULTI_ROOM) {
   try {
@@ -243,6 +246,11 @@ function joinRoomPresence(code) {
   myRef.onDisconnect().remove();
   // remove any lingering input node on disconnect
   mpDb.ref('rooms/' + code + '/inputs/' + mpUid).onDisconnect().remove();
+
+  // Ensure NPCs exist for this client — if snapshot-based world hasn't been applied, spawn locally
+  if (!npcs || npcs.length === 0) {
+    try { spawnNPCs(); } catch(e){ console.warn('spawnNPCs err', e); }
+  }
 
   // Update banner with players count
   playersRef.on('value', snap => {
@@ -306,6 +314,7 @@ function sendInputState(){
     ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].forEach(k => { short[k]=!!keys[k]; });
     const p = { keys: short, ts: Date.now(), lastShot: pendingShotTs || 0, pos: { x: player.x, y: player.y } };
     mpDb.ref('rooms/' + MULTI_ROOM + '/inputs/' + mpUid).set(p);
+    console.debug('sendInputState', MULTI_ROOM, mpUid, p);
     // Clear the pendingShotTs after sending once (host will process it)
     pendingShotTs = 0;
   } catch(e){ console.warn('sendInputState err', e); }
@@ -340,91 +349,102 @@ function applySnapshot(snap){
       }
     }
 
-    // Replace NPCs with snapshot (lightweight)
-    if (Array.isArray(snap.npcs)){
-      npcs.length = 0;
-      for (const nn of snap.npcs){
-        const obj = {
-          x: nn.x || 0,
-          y: nn.y || GROUND_Y - NPC_H,
-          vy: 0,
-          onGround: true,
-          hp: typeof nn.hp === 'number' ? nn.hp : (nn.maxHp || 10),
-          maxHp: typeof nn.maxHp === 'number' ? nn.maxHp : (nn.hp || 10),
-          dead: !!nn.dead,
-          deadTimer: nn.deadTimer || 0,
-          animTick: nn.animTick || 0,
-          animFrame: nn.animFrame || 0,
-          touching: false,
-          jumpCooldown: nn.jumpCooldown || 0,
-          attackCooldown: nn.attackCooldown || 0,
-          attackCooldownFrames: nn.attackCooldownFrames || (nn.isBoss ? BOSS_ATTACK_COOLDOWN_FRAMES : NPC_ATTACK_COOLDOWN_FRAMES),
-          isBoss: !!nn.isBoss,
-          isTank: !!nn.isTank,
-          contactDamage: typeof nn.contactDamage === 'number' ? nn.contactDamage : (nn.isBoss ? BOSS_BASE_DMG : 0.5 * LVL),
-          rielReward: nn.rielReward || 2,
-          w: nn.w || (nn.isBoss ? NPC_W*2 : NPC_W),
-          h: nn.h || (nn.isBoss ? NPC_H*2 : NPC_H)
-        };
-        npcs.push(obj);
-      }
-    }
-
-    // Magazines
-    if (Array.isArray(snap.magazines)){
-      magazines.length = 0;
-      for (const m of snap.magazines) magazines.push({ x:m.x, y:m.y, w:m.w||10, h:m.h||8, collected:!!m.collected });
-    }
-
-    // Powerups
-    if (Array.isArray(snap.powerups)){
-      powerups.length = 0;
-      for (const p of snap.powerups) powerups.push({ x:p.x, y:p.y, w:p.w||12, h:p.h||10, type:p.type||'jump', collected:!!p.collected });
-    }
-
-    // Lasers
-    if (Array.isArray(snap.lasers)){
-      lasers.length = 0;
-      for (const l of snap.lasers) lasers.push({ x:l.x, y:l.y, w:l.w, h:l.h||6, lastDamageFrame: frameCount - 999 });
-    }
-
-    // Bullets — merge host-authoritative bullets with local predicted bullets (clients only)
-    if (Array.isArray(snap.bullets)){
-      if (!mpIsHost) {
-        const auth = snap.bullets.map(b => ({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive, owner: b.owner || null, createdFromInputTs: b.createdFromInputTs || null }));
-        // Remove predicted bullets that are acknowledged by the server
-        const remainingPred = [];
-        for (const p of predictedBullets) {
-          const matched = auth.some(a => a.owner && p.owner && a.owner === p.owner && a.createdFromInputTs === p.createdFromInputTs);
-          if (!matched) remainingPred.push(p);
+    // If snapshot reconciliation is disabled (peer-sim mode), avoid replacing full world arrays
+    if (USE_SNAPSHOT_RECONCILE) {
+      // Replace NPCs with snapshot (lightweight)
+      if (Array.isArray(snap.npcs)){
+        npcs.length = 0;
+        for (const nn of snap.npcs){
+          const obj = {
+            x: nn.x || 0,
+            y: nn.y || GROUND_Y - NPC_H,
+            vy: 0,
+            onGround: true,
+            hp: typeof nn.hp === 'number' ? nn.hp : (nn.maxHp || 10),
+            maxHp: typeof nn.maxHp === 'number' ? nn.maxHp : (nn.hp || 10),
+            dead: !!nn.dead,
+            deadTimer: nn.deadTimer || 0,
+            animTick: nn.animTick || 0,
+            animFrame: nn.animFrame || 0,
+            touching: false,
+            jumpCooldown: nn.jumpCooldown || 0,
+            attackCooldown: nn.attackCooldown || 0,
+            attackCooldownFrames: nn.attackCooldownFrames || (nn.isBoss ? BOSS_ATTACK_COOLDOWN_FRAMES : NPC_ATTACK_COOLDOWN_FRAMES),
+            isBoss: !!nn.isBoss,
+            isTank: !!nn.isTank,
+            contactDamage: typeof nn.contactDamage === 'number' ? nn.contactDamage : (nn.isBoss ? BOSS_BASE_DMG : 0.5 * LVL),
+            rielReward: nn.rielReward || 2,
+            w: nn.w || (nn.isBoss ? NPC_W*2 : NPC_W),
+            h: nn.h || (nn.isBoss ? NPC_H*2 : NPC_H)
+          };
+          npcs.push(obj);
         }
-        // Compose final bullets array: authoritative + remaining predicted
-        bullets.length = 0;
-        for (const a of auth) bullets.push(a);
-        for (const p of remainingPred) bullets.push(p);
-        // Keep predictedBullets list updated
-        predictedBullets.length = 0;
-        for (const p of remainingPred) predictedBullets.push(p);
-      } else {
-        // Host just takes authoritative bullets
+      }
+
+      // Magazines
+      if (Array.isArray(snap.magazines)){
+        magazines.length = 0;
+        for (const m of snap.magazines) magazines.push({ x:m.x, y:m.y, w:m.w||10, h:m.h||8, collected:!!m.collected });
+      }
+
+      // Powerups
+      if (Array.isArray(snap.powerups)){
+        powerups.length = 0;
+        for (const p of snap.powerups) powerups.push({ x:p.x, y:p.y, w:p.w||12, h:p.h||10, type:p.type||'jump', collected:!!p.collected });
+      }
+
+      // Lasers
+      if (Array.isArray(snap.lasers)){
+        lasers.length = 0;
+        for (const l of snap.lasers) lasers.push({ x:l.x, y:l.y, w:l.w, h:l.h||6, lastDamageFrame: frameCount - 999 });
+      }
+
+      // Bullets — merge host-authoritative bullets with local predicted bullets (clients only)
+      if (Array.isArray(snap.bullets)){
+        if (!mpIsHost) {
+          const auth = snap.bullets.map(b => ({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive, owner: b.owner || null, createdFromInputTs: b.createdFromInputTs || null }));
+          // Remove predicted bullets that are acknowledged by the server
+          const remainingPred = [];
+          for (const p of predictedBullets) {
+            const matched = auth.some(a => a.owner && p.owner && a.owner === p.owner && a.createdFromInputTs === p.createdFromInputTs);
+            if (!matched) remainingPred.push(p);
+          }
+          // Compose final bullets array: authoritative + remaining predicted
+          bullets.length = 0;
+          for (const a of auth) bullets.push(a);
+          for (const p of remainingPred) bullets.push(p);
+          // Keep predictedBullets list updated
+          predictedBullets.length = 0;
+          for (const p of remainingPred) predictedBullets.push(p);
+        } else {
+          // Host just takes authoritative bullets
+          bullets.length = 0;
+          for (const b of snap.bullets) bullets.push({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive, owner: b.owner || null, createdFromInputTs: b.createdFromInputTs || null });
+        }
+      }
+
+      // Other players (clients) — simple representation
+      if (Array.isArray(snap.otherPlayers)){
+        // Replace local otherPlayers only on client side
+        if (!mpIsHost) {
+          // clear existing and rebuild
+          // Note: local clients won't simulate other players' physics; they rely on snapshot positions
+          const tmp = {};
+          for (const op of snap.otherPlayers) {
+            tmp[op.uid] = { x: op.x, y: op.y, hp: op.hp, bullets: op.bullets, lives: op.lives, facingRight: op.facingRight, animFrame: op.animFrame, gunFlash: op.gunFlash };
+          }
+          // assign into otherPlayers for rendering
+          for (const k in otherPlayers) if (!tmp[k]) delete otherPlayers[k];
+          for (const k in tmp) otherPlayers[k] = { ...otherPlayers[k], ...tmp[k] };
+        }
+      }
+    } else {
+      // Peer-sim mode: avoid overwriting world/entity arrays from snapshots (they may be empty)
+      // Only apply non-positional player UI fields (hp, bullets, lives, anim/gunFlash) and campaign level
+      if (Array.isArray(snap.bullets) && mpIsHost) {
+        // allow host to accept authoritative bullets if host
         bullets.length = 0;
         for (const b of snap.bullets) bullets.push({ x:b.x, y:b.y, dx:b.dx, dy:b.dy, alive: !!b.alive, owner: b.owner || null, createdFromInputTs: b.createdFromInputTs || null });
-      }
-    }
-
-    // Other players (clients) — simple representation
-    if (Array.isArray(snap.otherPlayers)){
-      // Replace local otherPlayers only on client side
-      if (!mpIsHost) {
-        // clear existing and rebuild
-        // Note: local clients won't simulate other players' physics; they rely on snapshot positions
-        const tmp = {};
-        for (const op of snap.otherPlayers) {
-          tmp[op.uid] = { x: op.x, y: op.y, hp: op.hp, bullets: op.bullets, lives: op.lives, facingRight: op.facingRight, animFrame: op.animFrame, gunFlash: op.gunFlash };
-        }
-        // assign into otherPlayers for rendering
-        for (const k in otherPlayers) if (!tmp[k]) delete otherPlayers[k];
-        for (const k in tmp) otherPlayers[k] = { ...otherPlayers[k], ...tmp[k] };
       }
     }
 
@@ -454,6 +474,7 @@ function processInputsForHost(snapshotVal){
         input: dat.keys || {}, lastSeen: dat.ts || now,
         pendingShotTs: dat.lastShot || 0
       };
+      console.debug('spawned otherPlayer', uid, otherPlayers[uid]);
     } else {
       // update input and last seen
       otherPlayers[uid].input = dat.keys || {};
@@ -738,12 +759,12 @@ window.addEventListener('keydown', e => {
     }
   }
 
-  // Send input state to host when in multiplayer (non-host clients)
-  if (typeof MULTI_ROOM !== 'undefined' && MULTI_ROOM && typeof mpDb !== 'undefined' && mpDb && !mpIsHost && typeof mpUid !== 'undefined' && mpUid) {
+  // Send input state to DB when in multiplayer (all clients including host)
+  if (typeof MULTI_ROOM !== 'undefined' && MULTI_ROOM && typeof mpDb !== 'undefined' && mpDb && typeof mpUid !== 'undefined' && mpUid) {
     sendInputState();
   }
 });
-window.addEventListener('keyup',  e => { keys[e.code] = false; if (typeof MULTI_ROOM !== 'undefined' && MULTI_ROOM && typeof mpDb !== 'undefined' && mpDb && !mpIsHost && typeof mpUid !== 'undefined' && mpUid) sendInputState(); });
+window.addEventListener('keyup',  e => { keys[e.code] = false; if (typeof MULTI_ROOM !== 'undefined' && MULTI_ROOM && typeof mpDb !== 'undefined' && mpDb && typeof mpUid !== 'undefined' && mpUid) sendInputState(); });
 
 let mouseX = 0, mouseY = 0;
 canvas.addEventListener('mousemove', e => {
@@ -950,8 +971,8 @@ function updatePlayer() {
     player.shootTimer = SHOOT_COOLDOWN;
   }
 
-  // Reconciliation: nudge local predicted position toward server authoritative position when not host
-  if (!mpIsHost && typeof player.serverX === 'number') {
+  // Reconciliation: optionally nudge local predicted position toward server authoritative position (disabled in peer-sim)
+  if (USE_SNAPSHOT_RECONCILE && !mpIsHost && typeof player.serverX === 'number') {
     const sx = player.serverX; const sy = player.serverY || player.y;
     const dx = sx - player.x; const dy = sy - player.y;
     const dist = Math.hypot(dx, dy);
