@@ -274,21 +274,20 @@ function joinRoomPresence(code) {
     if (mpIsHost) processInputsForHost(val);
   });
 
-  // Listen for shop state — if host is in the shop, clients should wait
+  // Listen for shop state — when host enters shop, everyone should go to shop.html?room=CODE
   mpDb.ref('rooms/' + code + '/inShop').on('value', snap => {
     const val = snap.val();
-    if (!val) {
-      // shop closed — resume if waiting
-      if (gameState === 'waiting_for_host') {
-        gameState = 'playing';
-        setStatus('Host returned — resuming');
+    const inShopPage = window.location.pathname.endsWith('shop.html');
+    if (val === true) {
+      // redirect all players (host and clients) to shop page if not already there
+      if (!inShopPage) {
+        window.location.href = 'shop.html?room=' + encodeURIComponent(code);
       }
       return;
     }
-    // if host entered shop and this client is NOT host, show waiting overlay
-    if (val === true && !mpIsHost) {
-      gameState = 'waiting_for_host';
-      setStatus('Host is in the shop — waiting...');
+    // shop closed — if currently on shop page, redirect back to game
+    if (val === false && inShopPage) {
+      window.location.href = 'game.html?room=' + encodeURIComponent(code);
     }
   });
 }
@@ -312,19 +311,18 @@ function applySnapshot(snap){
     // basic campaign sync
     if (typeof snap.campaignLevel !== 'undefined') campaign.level = snap.campaignLevel;
     
-    // Player authoritative values — only update if THIS client is not the one sending inputs
-    // (i.e., only apply if we are the host receiving our own snapshot, or if this is truly another player)
-    if (snap.player && mpIsHost) {
-      // Host uses its own player state from the snapshot
-      player.x = snap.player.x || player.x;
-      player.y = snap.player.y || player.y;
+    // Player authoritative values — always apply host snapshot so clients mirror host screen
+    if (snap.player) {
+      player.x = (typeof snap.player.x === 'number') ? snap.player.x : player.x;
+      player.y = (typeof snap.player.y === 'number') ? snap.player.y : player.y;
       player.hp = typeof snap.player.hp === 'number' ? snap.player.hp : player.hp;
       player.maxHp = typeof snap.player.maxHp === 'number' ? snap.player.maxHp : player.maxHp;
       player.bullets = typeof snap.player.bullets === 'number' ? snap.player.bullets : player.bullets;
       player.lives = typeof snap.player.lives === 'number' ? snap.player.lives : player.lives;
       player.facingRight = !!snap.player.facingRight;
+      player.animFrame = typeof snap.player.animFrame !== 'undefined' ? snap.player.animFrame : player.animFrame;
+      player.gunFlash = typeof snap.player.gunFlash !== 'undefined' ? snap.player.gunFlash : player.gunFlash;
     }
-    // Non-host clients DON'T apply snap.player — they maintain their own local player for camera
 
     // Replace NPCs with snapshot (lightweight)
     if (Array.isArray(snap.npcs)){
