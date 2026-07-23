@@ -513,6 +513,37 @@ if (!campaign) {
   };
 }
 
+// ─── MULTIPLAYER FIREBASE SETUP (shop page) ─────────────────────────
+const SHOP_URL_PARAMS = new URLSearchParams(window.location.search || '');
+const SHOP_ROOM = SHOP_URL_PARAMS.get('room');
+let shopDb = null, shopUid = null, shopIsHost = false;
+if (SHOP_ROOM) {
+  try {
+    const firebaseConfig = {
+      apiKey: "AIzaSyBu4N1LXy3dgnHS6yZKOdGzY4baby8fqvQ",
+      authDomain: "riel-runner.firebaseapp.com",
+      projectId: "riel-runner",
+      storageBucket: "riel-runner.firebasestorage.app",
+      messagingSenderId: "73958110392",
+      appId: "1:73958110392:web:a8a8751968ff54b9d1f04d",
+      measurementId: "G-EX5FSVV7DC"
+    };
+    if (!firebase.apps || !firebase.apps.length) firebase.initializeApp(firebaseConfig);
+    shopDb = firebase.database();
+    firebase.auth().onAuthStateChanged(user => {
+      if (user) {
+        shopUid = user.uid;
+        // detect if host
+        shopDb.ref('rooms/' + SHOP_ROOM + '/host').once('value').then(snap => {
+          shopIsHost = (snap.val() === shopUid);
+        }).catch(()=>{});
+      } else {
+        firebase.auth().signInAnonymously().catch(e => console.warn('shop auth err', e));
+      }
+    });
+  } catch(e) { console.warn('shop fb init', e); }
+}
+
 // ─── PIXEL GUN DRAWING ───────────────────────────────────────────────
 const gunCanvas = document.getElementById('gun-canvas');
 const gctx = gunCanvas.getContext('2d');
@@ -647,48 +678,91 @@ function saveCampaign() {
 }
 
 function continueToGame() {
-  // Advance to next level
+  // Advance to next level and save
   campaign.level++;
   campaign.lives = 3;
-  // Write to localStorage BEFORE redirect so game.html reads the correct level
-  localStorage.setItem('activeCampaign', JSON.stringify(campaign));
-  const idx = parseInt(localStorage.getItem('activeCampaignIdx'));
-  if (!isNaN(idx)) {
-    try {
-      const all = JSON.parse(localStorage.getItem('rielrunner_campaigns')) || [];
-      if (all[idx]) {
-        all[idx] = { ...all[idx], ...campaign, lastPlayed: Date.now() };
-        localStorage.setItem('rielrunner_campaigns', JSON.stringify(all));
+  saveCampaign();
+
+  // If multiplayer room present, mark this player's shopDone and show waiting overlay
+  if (SHOP_ROOM && shopDb) {
+    ensureShopAuth(() => {
+      try {
+        const shopDoneRef = shopDb.ref('rooms/' + SHOP_ROOM + '/shopDone/' + shopUid);
+        shopDoneRef.set({ ts: Date.now() });
+        shopDoneRef.onDisconnect().remove();
+
+        // Show waiting overlay on shop page
+        showShopWaitingOverlay();
+
+        // Track players & done lists
+        let playersCache = {};
+        let doneCache = {};
+
+        const playersRef = shopDb.ref('rooms/' + SHOP_ROOM + '/inGamePlayers');
+        const doneRef = shopDb.ref('rooms/' + SHOP_ROOM + '/shopDone');
+
+        function updateWaitingDisplay(pObj, dObj) {
+          if (pObj) playersCache = pObj;
+          if (dObj) doneCache = dObj;
+          const pCount = Object.keys(playersCache || {}).length;
+          const dCount = Object.keys(doneCache || {}).length;
+          const el = document.getElementById('shop-wait-count');
+          if (el) el.textContent = dCount + ' / ' + pCount + ' finished';
+
+          if (pCount > 0 && dCount >= pCount) {
+            // All done — host should clear inShop so everyone returns to game
+            shopDb.ref('rooms/' + SHOP_ROOM + '/host').once('value').then(snap => {
+              const hostUid = snap.val();
+              if (hostUid === shopUid) {
+                shopDb.ref('rooms/' + SHOP_ROOM + '/inShop').set(false).then(()=>{
+                  // cleanup shopDone
+                  shopDb.ref('rooms/' + SHOP_ROOM + '/shopDone').remove().catch(()=>{});
+                }).catch(()=>{});
+              }
+            }).catch(()=>{});
+          }
+        }
+
+        // Listen for changes
+        playersRef.on('value', snap => updateWaitingDisplay(snap.val() || {}, null));
+        doneRef.on('value', snap => updateWaitingDisplay(null, snap.val() || {}));
+
+      } catch (e) {
+        console.warn('shop continue err', e);
+        // fallback to immediate redirect
+        window.location.href = 'game.html?room=' + encodeURIComponent(SHOP_ROOM);
       }
-    } catch {}
+    });
+    return;
   }
 
-  // If room present, clear inShop flag so clients resume, then redirect with room
-  const urlParams = new URLSearchParams(window.location.search || '');
-  const room = urlParams.get('room');
-  if (room) {
-    try {
-      const firebaseConfig = {
-        apiKey: "AIzaSyBu4N1LXy3dgnHS6yZKOdGzY4baby8fqvQ",
-        authDomain: "riel-runner.firebaseapp.com",
-        projectId: "riel-runner",
-        storageBucket: "riel-runner.firebasestorage.app",
-        messagingSenderId: "73958110392",
-        appId: "1:73958110392:web:a8a8751968ff54b9d1f04d",
-        measurementId: "G-EX5FSVV7DC"
-      };
-      if (!firebase.apps || !firebase.apps.length) firebase.initializeApp(firebaseConfig);
-      const db = firebase.database();
-      db.ref('rooms/' + room + '/inShop').set(false).then(()=>{
-        // redirect back with room param so game.js picks it up
-        window.location.href = 'game.html?room=' + encodeURIComponent(room);
-      }).catch(()=>{ window.location.href = 'game.html?room=' + encodeURIComponent(room); });
-      return;
-    } catch(e){ console.warn('shop continue fb err', e); }
-  }
-
+  // Single-player or no room: just go back to game
   window.location.href = 'game.html';
 }
+
+function ensureShopAuth(cb) {
+  if (shopUid) return cb();
+  const off = firebase.auth().onAuthStateChanged(u => {
+    if (u) { shopUid = u.uid; off(); cb(); }
+  });
+  firebase.auth().signInAnonymously().catch(e => console.warn('shop auth', e));
+}
+
+function showShopWaitingOverlay() {
+  if (document.getElementById('shop-wait-overlay')) return;
+  const ov = document.createElement('div');
+  ov.id = 'shop-wait-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,14,26,0.9);z-index:150;font-family:Press Start 2P;color:#f5c400;';
+  ov.innerHTML = `
+    <div style="text-align:center;max-width:520px;padding:20px;border:4px solid #f5c400;background:#0a0e1a;">
+      <div style="font-size:20px;margin-bottom:12px;">WAITING FOR OTHERS</div>
+      <div id="shop-wait-count" style="font-size:12px;color:#ddd;">0 / 0 finished</div>
+      <div style="margin-top:14px;font-size:9px;color:#888;">Everyone will return to the game when all players finish their shop.</div>
+    </div>
+  `;
+  document.body.appendChild(ov);
+}
+
 
 // ─── TOAST ───────────────────────────────────────────────────────────
 let toastTimer;
